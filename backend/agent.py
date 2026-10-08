@@ -1,11 +1,12 @@
 import os
+import re
 from dotenv import load_dotenv
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import SystemMessage, HumanMessage
 from langgraph.graph import StateGraph, MessagesState, START
 from langgraph.prebuilt import ToolNode, tools_condition
 
-from crud_tools import all_tools
+from crud_tools import all_tools, get_records, create_record, update_record, delete_record
 
 load_dotenv()
 
@@ -13,22 +14,64 @@ load_dotenv()
 if not os.getenv("GEMINI_API_KEY"):
     raise ValueError("GEMINI_API_KEY environment variable is not set.")
 
-# Initialize the Gemini model with tool binding
+# Use the lightest available Gemini model to minimize quota consumption
 llm = ChatGoogleGenerativeAI(
-    model="gemini-flash-latest",
+    model="gemini-flash-lite-latest",
     temperature=0
 )
 llm_with_tools = llm.bind_tools(all_tools)
 
-# System prompt that strictly enforces pre-fetching before mutation
-SYSTEM_PROMPT = """You are an accurate and helpful Database Administrator AI assistant for an employee directory.
-Your role is to manage records in the 'employees' table (fields: id, name, department, position, email, phone) using your provided tools.
+# Concise system prompt — shorter prompts = fewer tokens = less quota used
+SYSTEM_PROMPT = """You are a Database Administrator AI for an employee directory.
+Manage records (id, name, department, position, email, phone) using your tools.
 
-STRICT OPERATIONAL GUIDELINES:
-1. ALWAYS call `get_records` to look up existing records BEFORE attempting an `update_record` or `delete_record` operation, unless the user has explicitly provided the confirmed numeric ID in this turn. This guarantees you are acting on the correct record.
-2. For `create_record`, ensure all required fields (name, department, position, email) are supplied. If any required information is missing, ask the user for clarification before calling the tool.
-3. Keep responses clean, concise, and report the outcome directly to the user.
+RULES:
+1. Call get_records FIRST before update_record or delete_record (to verify the ID).
+2. For create_record, ask for missing required fields (name, department, position, email).
+3. Be brief and direct in your responses.
 """
+
+# ─── Fast-path keyword patterns ──────────────────────────────────────────────
+# These handle simple requests WITHOUT calling the LLM, saving quota.
+
+_LIST_PATTERNS = re.compile(
+    r"\b(list|show|get|display|fetch|view|all|everyone|employees)\b",
+    re.IGNORECASE
+)
+_SEARCH_PATTERNS = re.compile(
+    r"\b(who is|find|search|look up|lookup)\b\s+(.+)",
+    re.IGNORECASE
+)
+
+
+def _try_fast_path(message: str):
+    """
+    Attempt to resolve common read queries directly without calling the LLM.
+    Returns a string response if handled, or None if the LLM should handle it.
+    """
+    msg = message.strip().lower()
+
+    # "list all", "show employees", "who works here", "get all", etc.
+    if _LIST_PATTERNS.search(msg) and not any(
+        kw in msg for kw in ["add", "create", "update", "delete", "remove", "change"]
+    ):
+        result = get_records.invoke({})
+        if "No matching" in result:
+            return "The employee directory is currently empty."
+        # Format the raw Supabase string response into a readable message
+        return f"Here are all employees in the directory:\n\n{result}"
+
+    # "who is Alice", "find Bob", "search for John"
+    m = _SEARCH_PATTERNS.search(msg)
+    if m:
+        name = m.group(2).strip().rstrip("?")
+        result = get_records.invoke({"query": name})
+        return result
+
+    return None  # Hand off to LLM
+
+
+# ─── LangGraph state graph ────────────────────────────────────────────────────
 
 def agent_node(state: MessagesState):
     """Executes the LLM node with system instructions prepended to the message history."""
@@ -38,30 +81,36 @@ def agent_node(state: MessagesState):
 
 tool_node = ToolNode(all_tools)
 
-# Construct LangGraph StateGraph
 builder = StateGraph(MessagesState)
-
 builder.add_node("agent", agent_node)
 builder.add_node("tools", tool_node)
-
 builder.add_edge(START, "agent")
-# Route to tool execution if the model invoked a tool; otherwise route to END
 builder.add_conditional_edges("agent", tools_condition)
 builder.add_edge("tools", "agent")
 
-# Compile into an executable graph
 agent_executor = builder.compile()
 
 
+def _extract_text(content) -> str:
+    """Normalise message content to a plain string."""
+    if isinstance(content, list):
+        parts = [p["text"] for p in content if isinstance(p, dict) and "text" in p]
+        return "\n".join(parts) if parts else str(content)
+    return str(content)
+
+
 def process_query(user_message: str) -> str:
-    """Invokes the LangGraph state machine with the user's natural language message."""
+    """
+    Main entry point.
+    1. Try the fast-path (zero LLM calls for simple reads).
+    2. Fall back to the LangGraph agent for complex / write operations.
+    """
+    # Fast-path: handle simple read queries without touching the LLM
+    fast_response = _try_fast_path(user_message)
+    if fast_response is not None:
+        return fast_response
+
+    # Full agent path for writes and complex natural language
     input_state = {"messages": [HumanMessage(content=user_message)]}
     final_state = agent_executor.invoke(input_state)
-    last_msg = final_state["messages"][-1]
-    content = last_msg.content
-    if isinstance(content, list):
-        text_parts = [
-            part["text"] for part in content if isinstance(part, dict) and "text" in part
-        ] or [str(p) for p in content]
-        return "\n".join(text_parts)
-    return str(content)
+    return _extract_text(final_state["messages"][-1].content)
