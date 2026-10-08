@@ -15,7 +15,7 @@ if not os.getenv("GEMINI_API_KEY"):
 
 # Initialize the Gemini model with tool binding
 llm = ChatGoogleGenerativeAI(
-    model="gemini-3.8-flash",
+    model="gemini-flash-latest",
     temperature=0
 )
 llm_with_tools = llm.bind_tools(all_tools)

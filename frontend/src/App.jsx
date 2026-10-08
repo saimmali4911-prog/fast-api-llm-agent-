@@ -28,13 +28,20 @@ export default function App() {
       })
 
       if (!response.ok) {
-        throw new Error(`Server returned error status ${response.status}`)
+        let errorDetail = `Server returned error status ${response.status}`
+        try {
+          const errJson = await response.json()
+          if (errJson.detail) {
+            errorDetail = errJson.detail
+          }
+        } catch (_) {}
+        throw new Error(errorDetail)
       }
 
       const data = await response.json()
       setMessages((prev) => [...prev, { role: 'assistant', text: data.response }])
     } catch (err) {
-      setError(`Failed to connect to backend: ${err.message}`)
+      setError(err.message)
     } finally {
       setLoading(false)
     }
